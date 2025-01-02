@@ -1,12 +1,13 @@
+from scapy.all import ARP, Ether, srp, sniff
+import threading
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from scapy.all import ARP, Ether, srp
-import psutil
-import threading
 import netifaces
-import wmi
 from mac_vendor_lookup import MacLookup
+import wmi
 import socket
+import psutil
 
 
 class NetworkScanner:
@@ -15,13 +16,13 @@ class NetworkScanner:
         self.ip_range = ip_range
         self.mac_lookup = MacLookup()
 
-        # Update the MAC vendor database during initialization
-        try:
-            print("Updating MAC vendor database...")
-            self.mac_lookup.update_vendors()  # Correct method call on the instance
-            print("MAC vendor database updated.")
-        except Exception as e:
-            print(f"Error updating MAC vendor database: {e}")
+        # # Update the MAC vendor database during initialization
+        # try:
+        #     print("Updating MAC vendor database...")
+        #     self.mac_lookup.update_vendors()
+        #     print("MAC vendor database updated.")
+        # except Exception as e:
+        #     print(f"Error updating MAC vendor database: {e}")
 
     def scan(self):
         """Discover devices and collect detailed information."""
@@ -79,25 +80,63 @@ class NetworkScanner:
 
 
 class BandwidthMonitor:
-    def __init__(self):
-        self.previous_stats = psutil.net_io_counters(pernic=True)
+    def __init__(self, interface):
+        self.interface = interface
+        self.device_bandwidth = {}
+
+    def start_sniffing(self):
+        """Start sniffing packets to track per-device bandwidth."""
+        threading.Thread(target=self._sniff_packets, daemon=True).start()
+
+    def _sniff_packets(self):
+        """Sniff packets and aggregate bandwidth usage per device."""
+        sniff(iface=self.interface, prn=self._process_packet, store=False)
+
+    def _process_packet(self, packet):
+        """Process a packet to track bandwidth usage per device."""
+        if packet.haslayer(ARP):
+            return  # Ignore ARP packets
+
+        if packet.haslayer("IP"):
+            src_ip = packet["IP"].src
+            dst_ip = packet["IP"].dst
+            length = len(packet)
+
+            # Track bandwidth for the source device
+            if src_ip not in self.device_bandwidth:
+                self.device_bandwidth[src_ip] = {"download": 0, "upload": 0}
+            self.device_bandwidth[src_ip]["upload"] += length
+
+            # Track bandwidth for the destination device
+            if dst_ip not in self.device_bandwidth:
+                self.device_bandwidth[dst_ip] = {"download": 0, "upload": 0}
+            self.device_bandwidth[dst_ip]["download"] += length
 
     def get_bandwidth_usage(self):
-        """Fetch bandwidth usage statistics for all interfaces."""
-        current_stats = psutil.net_io_counters(pernic=True)
-        bandwidth_usage = {}
-        try:
-            for nic, stats in current_stats.items():
-                if nic in self.previous_stats:
-                    prev_stats = self.previous_stats[nic]
-                    bandwidth_usage[nic] = {
-                        "download": stats.bytes_recv - prev_stats.bytes_recv,
-                        "upload": stats.bytes_sent - prev_stats.bytes_sent
-                    }
-            self.previous_stats = current_stats
-        except Exception as e:
-            print(f"Error fetching bandwidth usage: {e}")
-        return bandwidth_usage
+        """Fetch the current per-device bandwidth usage and reset counters."""
+        usage = {
+            ip: {
+                "download": self._format_bytes(data["download"] * 8),
+                "upload": self._format_bytes(data["upload"] * 8),
+            }
+            for ip, data in self.device_bandwidth.items()
+        }
+
+        # Reset the counters for instantaneous usage
+        for data in self.device_bandwidth.values():
+            data["download"] = 0
+            data["upload"] = 0
+
+        return usage
+
+    @staticmethod
+    def _format_bytes(size):
+        """Convert bytes to human-readable format."""
+        for unit in ['bit', 'Kb', 'Mb', 'Gb', 'Tb']:
+            if size < 1024.0:
+                return f"{size:.2f} {unit}"
+            size /= 1024.0
+        return f"{size:.2f} PB"
 
 
 class NetworkApp:
@@ -107,11 +146,16 @@ class NetworkApp:
         self.root.geometry("1200x700")
 
         self.interface = tk.StringVar()
-        self.ip_range = tk.StringVar(value="192.168.1.0/24")  # Default subnet range
+        self.ip_range = tk.StringVar(value=self.get_ip_range())  # Default subnet range
         self.scanner = None
-        self.bandwidth_monitor = BandwidthMonitor()
+        self.bandwidth_monitor = None
+        self.devices = []
 
         self.setup_ui()
+
+    def get_ip_range(self):
+        gateway = netifaces.gateways()['default'][netifaces.AF_INET][0]
+        return gateway.rsplit('.', 1)[0] + ".0/24"
 
     def setup_ui(self):
         control_frame = tk.Frame(self.root)
@@ -133,13 +177,13 @@ class NetworkApp:
         self.tree.heading("#2", text="MAC Address")
         self.tree.heading("#3", text="Device Type")
         self.tree.heading("#4", text="Open Ports")
-        self.tree.heading("#5", text="Bandwidth Usage")
+        self.tree.heading("#5", text="Bandwidth Usage (Download/Upload)")
 
         self.tree.column("#1", width=150)
         self.tree.column("#2", width=200)
         self.tree.column("#3", width=200)
         self.tree.column("#4", width=100)
-        self.tree.column("#5", width=150)
+        self.tree.column("#5", width=200)
 
         self.tree.pack(fill=tk.BOTH, expand=True, pady=10)
 
@@ -169,17 +213,17 @@ class NetworkApp:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to detect interface: {str(e)}")
 
-    def update_table(self, devices):
+    def update_table(self):
+        """Update the treeview table with real-time bandwidth usage."""
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        # Get bandwidth usage for all interfaces
         bandwidth_usage = self.bandwidth_monitor.get_bandwidth_usage()
 
-        for device in devices:
-            # Check if the current interface matches the device's MAC
-            interface_bandwidth = bandwidth_usage.get(self.interface.get(), {"download": 0, "upload": 0})
-            bandwidth = f"{interface_bandwidth['download']} B / {interface_bandwidth['upload']} B"
+        for device in self.devices:
+            ip = device.get("ip", "Unknown")
+            usage = bandwidth_usage.get(ip, {"download": "0 B", "upload": "0 B"})
+            bandwidth = f"{usage['download']} / {usage['upload']}"
             self.tree.insert("", tk.END, values=(
                 device.get("ip", "Unknown"),
                 device.get("mac", "Unknown"),
@@ -187,6 +231,8 @@ class NetworkApp:
                 ", ".join(map(str, device.get("open_ports", []))),
                 bandwidth
             ))
+
+        self.root.after(1000, self.update_table)
 
     def start_scan(self):
         interface = self.interface.get()
@@ -197,12 +243,14 @@ class NetworkApp:
 
         self.status_label.config(text="Status: Scanning...")
         self.scanner = NetworkScanner(interface, ip_range)
+        self.bandwidth_monitor = BandwidthMonitor(interface)
+        self.bandwidth_monitor.start_sniffing()
 
         def scan():
             try:
-                devices = self.scanner.scan()
-                self.update_table(devices)
-                self.status_label.config(text=f"Status: Found {len(devices)} devices")
+                self.devices = self.scanner.scan()
+                self.update_table()
+                self.status_label.config(text=f"Status: Found {len(self.devices)} devices")
             except Exception as e:
                 messagebox.showerror("Error", f"Scan failed: {str(e)}")
 
