@@ -5,96 +5,99 @@ import psutil
 import threading
 import netifaces
 import wmi
-import time
-import win32com.client
-import pythoncom
+from mac_vendor_lookup import MacLookup
+import socket
 
 
 class NetworkScanner:
-    def __init__(self, interface):
+    def __init__(self, interface, ip_range):
         self.interface = interface
+        self.ip_range = ip_range
+        self.mac_lookup = MacLookup()
+
+        # Update the MAC vendor database during initialization
+        try:
+            print("Updating MAC vendor database...")
+            self.mac_lookup.update_vendors()  # Correct method call on the instance
+            print("MAC vendor database updated.")
+        except Exception as e:
+            print(f"Error updating MAC vendor database: {e}")
 
     def scan(self):
-        devices = []
-        try:
-            pythoncom.CoInitialize()  # Initialize COM in the scanning thread
-            ip_range = self.get_ip_range()
-            broadcast = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
-            answered_list = srp(broadcast, timeout=2, iface=self.interface, verbose=False)[0]
+        """Discover devices and collect detailed information."""
+        devices = self.discover_devices()
 
-            for element in answered_list:
-                ip = element[1].psrc
-                mac = element[1].hwsrc
-                devices.append({
-                    "ip": ip,
-                    "mac": mac,
-                    "device_type": self.get_device_type(mac),
-                    "dhcp": self.is_dhcp_enabled(ip)
-                })
-        except Exception as e:
-            print(f"Error during scan: {e}")
-        finally:
-            pythoncom.CoUninitialize()  # Ensure COM is uninitialized in the thread
+        for device in devices:
+            mac = device["mac"]
+            ip = device["ip"]
+
+            # Add device type based on MAC OUI
+            device["type"] = self.get_device_type(mac)
+
+            # Check open ports to infer active services
+            device["open_ports"] = self.check_open_ports(ip)
+
         return devices
 
-    def get_ip_range(self):
-        gateway = netifaces.gateways()['default'][netifaces.AF_INET][0]
-        return gateway.rsplit('.', 1)[0] + ".0/24"
+    def discover_devices(self):
+        """Discover devices on the network using ARP."""
+        devices = []
+        try:
+            broadcast = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=self.ip_range)
+            answered_list = srp(broadcast, timeout=2, iface=self.interface, verbose=False)[0]
+
+            for sent, received in answered_list:
+                devices.append({
+                    "ip": received.psrc,
+                    "mac": received.hwsrc
+                })
+        except Exception as e:
+            print(f"Error during ARP discovery: {e}")
+
+        return devices
 
     def get_device_type(self, mac):
+        """Retrieve the device type (vendor) for a given MAC address."""
         try:
-            wmi_service = win32com.client.Dispatch("WbemScripting.SWbemLocator")
-            wmi_connection = wmi_service.ConnectServer(".", "root\\CIMV2")
-
-            query = "SELECT Name, MACAddress FROM Win32_NetworkAdapter WHERE MACAddress IS NOT NULL"
-            adapters = wmi_connection.ExecQuery(query)
-
-            for adapter in adapters:
-                if adapter.MACAddress and adapter.MACAddress.lower() == mac.lower():
-                    return adapter.Name or "Unknown"
+            return self.mac_lookup.lookup(mac)
         except Exception as e:
-            print(f"Pywin32 Error in get_device_type: {e}")
-        return "Unknown"
+            print(f"Error in MAC lookup for {mac}: {e}")
+            return "Unknown Vendor"
 
-    def is_dhcp_enabled(self, ip):
-        try:
-            wmi_service = win32com.client.Dispatch("WbemScripting.SWbemLocator")
-            wmi_connection = wmi_service.ConnectServer(".", "root\\CIMV2")
-
-            query = "SELECT IPAddress, DHCPEnabled FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled=TRUE"
-            configs = wmi_connection.ExecQuery(query)
-
-            for config in configs:
-                if config.IPAddress and ip in config.IPAddress:
-                    return "Enabled" if config.DHCPEnabled else "Disabled"
-        except Exception as e:
-            print(f"Pywin32 Error in is_dhcp_enabled: {e}")
-        return "Unknown"
-
+    def check_open_ports(self, ip, ports=[22, 80, 443]):
+        """Check common open ports to infer device type."""
+        open_ports = []
+        for port in ports:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(1)
+                    if sock.connect_ex((ip, port)) == 0:
+                        open_ports.append(port)
+            except Exception as e:
+                print(f"Error scanning port {port} on {ip}: {e}")
+        return open_ports
 
 
 class BandwidthMonitor:
     def __init__(self):
         self.previous_stats = psutil.net_io_counters(pernic=True)
 
-    def get_bandwidth_usage(self, ip):
+    def get_bandwidth_usage(self):
+        """Fetch bandwidth usage statistics for all interfaces."""
         current_stats = psutil.net_io_counters(pernic=True)
-        usage = {
-            "download": 0,
-            "upload": 0
-        }
+        bandwidth_usage = {}
         try:
             for nic, stats in current_stats.items():
                 if nic in self.previous_stats:
                     prev_stats = self.previous_stats[nic]
-                    usage = {
+                    bandwidth_usage[nic] = {
                         "download": stats.bytes_recv - prev_stats.bytes_recv,
                         "upload": stats.bytes_sent - prev_stats.bytes_sent
                     }
             self.previous_stats = current_stats
         except Exception as e:
             print(f"Error fetching bandwidth usage: {e}")
-        return f"{usage['download']} B / {usage['upload']} B"
+        return bandwidth_usage
 
 
 class NetworkApp:
@@ -104,6 +107,7 @@ class NetworkApp:
         self.root.geometry("1200x700")
 
         self.interface = tk.StringVar()
+        self.ip_range = tk.StringVar(value="192.168.1.0/24")  # Default subnet range
         self.scanner = None
         self.bandwidth_monitor = BandwidthMonitor()
 
@@ -118,6 +122,9 @@ class NetworkApp:
         self.interface_label = tk.Label(control_frame, textvariable=self.interface)
         self.interface_label.pack(side=tk.LEFT, padx=5)
 
+        tk.Label(control_frame, text="IP Range:").pack(side=tk.LEFT, padx=5)
+        tk.Entry(control_frame, textvariable=self.ip_range, width=15).pack(side=tk.LEFT, padx=5)
+
         tk.Button(control_frame, text="Scan", command=self.start_scan).pack(side=tk.LEFT, padx=5)
         tk.Button(control_frame, text="Save Results", command=self.save_results).pack(side=tk.LEFT, padx=5)
 
@@ -125,14 +132,14 @@ class NetworkApp:
         self.tree.heading("#1", text="IP Address")
         self.tree.heading("#2", text="MAC Address")
         self.tree.heading("#3", text="Device Type")
-        self.tree.heading("#4", text="DHCP Status")
-        self.tree.heading("#5", text="Bandwidth Usage (Download/Upload)")
+        self.tree.heading("#4", text="Open Ports")
+        self.tree.heading("#5", text="Bandwidth Usage")
 
-        self.tree.column("#1", width=200)
+        self.tree.column("#1", width=150)
         self.tree.column("#2", width=200)
         self.tree.column("#3", width=200)
         self.tree.column("#4", width=100)
-        self.tree.column("#5", width=200)
+        self.tree.column("#5", width=150)
 
         self.tree.pack(fill=tk.BOTH, expand=True, pady=10)
 
@@ -143,23 +150,22 @@ class NetworkApp:
         try:
             gateways = netifaces.gateways()
             default_gateway = gateways.get('default', {}).get(netifaces.AF_INET)
-            interface_guid = default_gateway[1] if default_gateway else None
+            if default_gateway:
+                interface_guid = default_gateway[1]
+                wmi_obj = wmi.WMI()
 
-            print(f"Default Gateway: {default_gateway}")
-            print(f"Detected Interface GUID: {interface_guid}")
+                # Find the friendly name corresponding to the GUID
+                for nic in wmi_obj.Win32_NetworkAdapter():
+                    if nic.GUID == interface_guid:
+                        friendly_name = nic.NetConnectionID
+                        if friendly_name in psutil.net_if_addrs():
+                            self.interface.set(friendly_name)
+                            self.status_label.config(text=f"Detected Interface: {friendly_name}")
+                            return
 
-            wmi_obj = wmi.WMI()
-            friendly_name = None
-            for nic in wmi_obj.Win32_NetworkAdapter():
-                if nic.GUID == interface_guid:
-                    friendly_name = nic.NetConnectionID
-                    break
-
-            if friendly_name and friendly_name in psutil.net_if_addrs():
-                self.interface.set(friendly_name)
-                self.status_label.config(text=f"Detected Interface: {friendly_name}")
+                messagebox.showwarning("Warning", "Detected interface not found in active interfaces.")
             else:
-                messagebox.showwarning("Warning", "Default interface not found in active interfaces.")
+                messagebox.showwarning("Warning", "No default gateway found.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to detect interface: {str(e)}")
 
@@ -167,24 +173,30 @@ class NetworkApp:
         for row in self.tree.get_children():
             self.tree.delete(row)
 
+        # Get bandwidth usage for all interfaces
+        bandwidth_usage = self.bandwidth_monitor.get_bandwidth_usage()
+
         for device in devices:
-            bandwidth = self.bandwidth_monitor.get_bandwidth_usage(device.get("ip", "Unknown"))
+            # Check if the current interface matches the device's MAC
+            interface_bandwidth = bandwidth_usage.get(self.interface.get(), {"download": 0, "upload": 0})
+            bandwidth = f"{interface_bandwidth['download']} B / {interface_bandwidth['upload']} B"
             self.tree.insert("", tk.END, values=(
                 device.get("ip", "Unknown"),
                 device.get("mac", "Unknown"),
-                device.get("device_type", "Unknown"),
-                device.get("dhcp", "Unknown"),
+                device.get("type", "Unknown"),
+                ", ".join(map(str, device.get("open_ports", []))),
                 bandwidth
             ))
 
     def start_scan(self):
         interface = self.interface.get()
-        if not interface:
-            messagebox.showwarning("Input Error", "Please detect or enter a network interface.")
+        ip_range = self.ip_range.get()
+        if not interface or not ip_range:
+            messagebox.showwarning("Input Error", "Please detect an interface and specify an IP range.")
             return
 
         self.status_label.config(text="Status: Scanning...")
-        self.scanner = NetworkScanner(interface)
+        self.scanner = NetworkScanner(interface, ip_range)
 
         def scan():
             try:
